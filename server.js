@@ -284,8 +284,6 @@ app.post('/api/log', upload.single('photo'), async (req, res) => {
       Date: { date: { start: b.eaten_at || new Date().toISOString() } },
       'Calories (kcal)': { number: numberOrNull(b.calories_kcal) },
       'Protein (g)': { number: numberOrNull(b.protein_g) },
-      'Calories range': { rich_text: text(b.calories) },
-      'Protein range': { rich_text: text(b.protein) },
       Items: { rich_text: text(b.items) },
       Notes: { rich_text: text(b.notes) }
     };
