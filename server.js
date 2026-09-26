@@ -47,8 +47,37 @@ app.use(express.static('public'));
 const prompt = `Look at this food photo. Respond with ONLY a JSON object, no markdown fences, no extra text, in exactly this shape:
 {"food_name": "string", "calories": "string (e.g. '350-420 kcal')", "protein": "string (e.g. '20-25g')", "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
 
+// Gemini free tier often returns 503 "high demand" (or 429 when a model's quota
+// is used up). Retry briefly, then fall back to the next model in the list.
+const GEMINI_MODELS = [
+  process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  ...(process.env.GEMINI_FALLBACK_MODELS || 'gemini-3.5-flash-lite,gemini-3.1-flash-lite')
+    .split(',').map(m => m.trim()).filter(Boolean)
+].filter((m, i, all) => all.indexOf(m) === i);
+const RETRYABLE_STATUS = new Set([429, 500, 503, 504]);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function analyzeWithGemini(base64Data, mediaType) {
-  const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+  let lastError;
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await callGemini(model, base64Data, mediaType);
+      } catch (err) {
+        lastError = err;
+        if (!RETRYABLE_STATUS.has(err.status)) throw err;
+        console.warn(`[retry] ${model} attempt ${attempt} failed (${err.status})`);
+        if (attempt < 2) await sleep(1500);
+      }
+    }
+  }
+  const busy = new Error('The AI service is busy right now. Please try again in a minute.');
+  busy.cause = lastError;
+  throw busy;
+}
+
+async function callGemini(model, base64Data, mediaType) {
+  console.log(`[step] trying Gemini model ${model}`);
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
@@ -87,7 +116,9 @@ async function analyzeWithGemini(base64Data, mediaType) {
   console.log('[step] Gemini API responded:', JSON.stringify(data).slice(0, 300));
 
   if (data.error) {
-    throw new Error('API error: ' + JSON.stringify(data.error));
+    const err = new Error('API error: ' + JSON.stringify(data.error));
+    err.status = data.error.code || response.status;
+    throw err;
   }
 
   const parts = data.candidates?.[0]?.content?.parts || [];

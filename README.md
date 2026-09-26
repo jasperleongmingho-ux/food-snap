@@ -23,7 +23,8 @@ calories, and protein, with a confidence note. No login, single user.
 Set `AI_PROVIDER` in `.env`:
 
 - `gemini` (default) — Google Gemini, free tier. Model set by `GEMINI_MODEL`
-  (default `gemini-3.6-flash`). Note: on the free tier Google may use the
+  (default `gemini-3.6-flash`). If it is busy, the server retries and falls back
+  to `GEMINI_FALLBACK_MODELS`. Note: on the free tier Google may use the
   photos/prompts to improve its products.
 - `anthropic` — Claude (`claude-sonnet-5`), paid, needs `ANTHROPIC_API_KEY`.
 
