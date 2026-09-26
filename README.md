@@ -1,7 +1,8 @@
 # Food Snap Estimator (v1)
 
-Minimal internal app: upload/take a food photo, an AI model estimates food name,
-calories, and protein, with a confidence note. No login, single user.
+Internal app: take or choose a food photo, an AI model estimates food name,
+calories, and protein. You can correct the numbers and save the meal (with photo)
+to a Notion food log. Single user, protected by APP_PASSWORD.
 
 ## Setup
 
@@ -30,6 +31,17 @@ Set `AI_PROVIDER` in `.env`:
 
 Restart the server after changing `.env`.
 
+## Food log (Notion)
+
+Saved meals go to the "Food Log" Notion database (gallery + daily calories chart).
+
+1. Create an internal integration at https://www.notion.so/profile/integrations
+   and copy its secret into `NOTION_TOKEN`.
+2. Open the Food Log database in Notion → `•••` → Connections → add the integration.
+3. `NOTION_DATABASE_ID` is the database's ID (already set in `.env.example`).
+
+Photos are shrunk in the browser to ~1280px JPEG before upload.
+
 ## Why a server instead of pure frontend?
 
 The API key stays on the server (`server.js`), never exposed in the browser.
@@ -39,4 +51,3 @@ The frontend just uploads the photo to `/api/analyze` and shows the result.
 
 - Model names change over time — if you get a "model not found" error, check
   https://ai.google.dev/gemini-api/docs/models and update `GEMINI_MODEL`.
-- No image storage, no history, no auth — intentionally minimal for v1.

@@ -16,12 +16,16 @@
   button { width: 100%; padding: 14px; font-size: 1rem; border: none; border-radius: 10px; background: #3b6e4f; color: white; cursor: pointer; }
   button:disabled { opacity: 0.5; cursor: default; }
   #result { margin-top: 24px; background: #fff; border: 1px solid #e4e2dc; border-radius: 10px; padding: 18px; display: none; }
-  #result h2 { margin: 0 0 12px; font-size: 1.15rem; }
-  .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #e4e2dc; }
-  .row:last-of-type { border-bottom: none; }
-  .row span:first-child { color: #6b6b66; }
-  .confidence { margin-top: 12px; font-size: 0.9rem; color: #6b6b66; font-style: italic; }
-  #status { margin-top: 12px; font-size: 0.9rem; color: #6b6b66; text-align: center; }
+  .field { display: block; margin-bottom: 12px; }
+  .field span { display: block; font-size: 0.85rem; color: #6b6b66; margin-bottom: 4px; }
+  .field input, .field select { width: 100%; box-sizing: border-box; padding: 10px; font-size: 1rem; border: 1px solid #e4e2dc; border-radius: 8px; background: #fff; color: inherit; }
+  .field input.name { font-size: 1.1rem; font-weight: 600; }
+  .two { display: flex; gap: 10px; }
+  .two .field { flex: 1; }
+  .range { font-size: 0.8rem; color: #6b6b66; margin-top: 4px; }
+  .confidence { margin: 4px 0 16px; font-size: 0.9rem; color: #6b6b66; font-style: italic; }
+  #status, #saveStatus { margin-top: 12px; font-size: 0.9rem; color: #6b6b66; text-align: center; }
+  #saveStatus a { color: #3b6e4f; }
 </style>
 </head>
 <body>
@@ -46,10 +50,34 @@
   <div id="status"></div>
 
   <div id="result">
-    <h2 id="foodName"></h2>
-    <div class="row"><span>Calories</span><span id="calories"></span></div>
-    <div class="row"><span>Protein</span><span id="protein"></span></div>
+    <label class="field">
+      <span>Food</span>
+      <input id="foodName" class="name" type="text">
+    </label>
+    <div class="two">
+      <label class="field">
+        <span>Calories (kcal)</span>
+        <input id="caloriesKcal" type="number" inputmode="numeric" min="0">
+        <div class="range" id="caloriesRange"></div>
+      </label>
+      <label class="field">
+        <span>Protein (g)</span>
+        <input id="proteinG" type="number" inputmode="decimal" min="0" step="0.1">
+        <div class="range" id="proteinRange"></div>
+      </label>
+    </div>
+    <label class="field">
+      <span>Meal</span>
+      <select id="meal">
+        <option>Breakfast</option>
+        <option>Lunch</option>
+        <option>Dinner</option>
+        <option>Snack</option>
+      </select>
+    </label>
     <p class="confidence" id="confidence"></p>
+    <button id="saveBtn">Save to log</button>
+    <div id="saveStatus"></div>
   </div>
 </main>
 
@@ -58,27 +86,66 @@
   const galleryInput = document.getElementById('galleryInput');
   const preview = document.getElementById('preview');
   const analyzeBtn = document.getElementById('analyzeBtn');
+  const saveBtn = document.getElementById('saveBtn');
   const statusEl = document.getElementById('status');
+  const saveStatusEl = document.getElementById('saveStatus');
   const resultEl = document.getElementById('result');
+  const $ = id => document.getElementById(id);
 
-  let selectedFile = null;
+  let selectedFile = null;   // photo sent for analysis and saved to the log
+  let lastResult = null;     // AI result, for the range/notes fields
 
-  function onFileChosen(input) {
+  // Shrink photos before upload: faster on mobile data and fits Notion's
+  // 5 MB free-plan limit. Falls back to the original if the browser can't decode it.
+  async function shrinkPhoto(file, maxSide = 1280) {
+    try {
+      const bitmap = await createImageBitmap(file);
+      const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(bitmap.width * scale);
+      canvas.height = Math.round(bitmap.height * scale);
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
+      if (!blob) return file;
+      return new File([blob], 'meal.jpg', { type: 'image/jpeg' });
+    } catch (err) {
+      console.warn('[warn] could not shrink photo, using original', err);
+      return file;
+    }
+  }
+
+  function defaultMeal() {
+    const h = new Date().getHours();
+    if (h >= 5 && h < 11) return 'Breakfast';
+    if (h >= 11 && h < 15) return 'Lunch';
+    if (h >= 17 && h < 22) return 'Dinner';
+    return 'Snack';
+  }
+
+  // Local time with timezone offset, so Notion shows the time you ate
+  function localIsoNow() {
+    const d = new Date();
+    const pad = n => String(Math.abs(n)).padStart(2, '0');
+    const off = -d.getTimezoneOffset();
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
+      `${off >= 0 ? '+' : '-'}${pad(Math.trunc(off / 60))}:${pad(off % 60)}`;
+  }
+
+  async function onFileChosen(input) {
     const file = input.files[0];
     input.value = ''; // allow picking the same photo again
     if (!file) return;
     console.log('[step] file selected', file.name, file.type, file.size);
-    selectedFile = file;
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      preview.src = reader.result;
-      preview.style.display = 'block';
-      analyzeBtn.disabled = false;
-      resultEl.style.display = 'none';
-      statusEl.textContent = '';
-    };
-    reader.readAsDataURL(file);
+    preview.src = URL.createObjectURL(file);
+    preview.style.display = 'block';
+    resultEl.style.display = 'none';
+    statusEl.textContent = '';
+    analyzeBtn.disabled = true;
+
+    selectedFile = await shrinkPhoto(file);
+    console.log('[step] photo ready', selectedFile.type, selectedFile.size);
+    analyzeBtn.disabled = false;
   }
 
   cameraInput.addEventListener('change', () => onFileChosen(cameraInput));
@@ -101,10 +168,17 @@
 
       if (parsed.error) throw new Error(parsed.error);
 
-      document.getElementById('foodName').textContent = parsed.food_name;
-      document.getElementById('calories').textContent = parsed.calories;
-      document.getElementById('protein').textContent = parsed.protein;
-      document.getElementById('confidence').textContent = parsed.confidence_note;
+      lastResult = parsed;
+      $('foodName').value = parsed.food_name || '';
+      $('caloriesKcal').value = parsed.calories_kcal ?? '';
+      $('proteinG').value = parsed.protein_g ?? '';
+      $('caloriesRange').textContent = parsed.calories ? 'AI range: ' + parsed.calories : '';
+      $('proteinRange').textContent = parsed.protein ? 'AI range: ' + parsed.protein : '';
+      $('meal').value = defaultMeal();
+      $('confidence').textContent = parsed.confidence_note || '';
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save to log';
+      saveStatusEl.textContent = '';
       resultEl.style.display = 'block';
       statusEl.textContent = '';
     } catch (err) {
@@ -112,6 +186,41 @@
       statusEl.textContent = 'Error: ' + err.message;
     } finally {
       analyzeBtn.disabled = false;
+    }
+  });
+
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+    saveStatusEl.textContent = '';
+
+    const formData = new FormData();
+    if (selectedFile) formData.append('photo', selectedFile);
+    formData.append('food_name', $('foodName').value.trim());
+    formData.append('calories_kcal', $('caloriesKcal').value);
+    formData.append('protein_g', $('proteinG').value);
+    formData.append('calories', lastResult?.calories || '');
+    formData.append('protein', lastResult?.protein || '');
+    formData.append('notes', lastResult?.confidence_note || '');
+    formData.append('meal', $('meal').value);
+    formData.append('eaten_at', localIsoNow());
+
+    try {
+      const response = await fetch('/api/log', { method: 'POST', body: formData });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error);
+      saveBtn.textContent = 'Saved ✓';
+      saveStatusEl.innerHTML = '';
+      const link = document.createElement('a');
+      link.href = data.url;
+      link.target = '_blank';
+      link.textContent = 'Open in Notion';
+      saveStatusEl.append(link);
+    } catch (err) {
+      console.error('[error]', err);
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save to log';
+      saveStatusEl.textContent = 'Error: ' + err.message;
     }
   });
 </script>

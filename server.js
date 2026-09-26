@@ -1,8 +1,7 @@
-// v1 — minimal server, no extra features
+// Food Snap server: photo analysis (Gemini/Claude) + optional Notion food log
 require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-
 const crypto = require('crypto');
 
 const app = express();
@@ -45,7 +44,7 @@ app.use((req, res, next) => {
 app.use(express.static('public'));
 
 const prompt = `Look at this food photo. Respond with ONLY a JSON object, no markdown fences, no extra text, in exactly this shape:
-{"food_name": "string", "calories": "string (e.g. '350-420 kcal')", "protein": "string (e.g. '20-25g')", "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
+{"food_name": "string", "calories": "string (e.g. '350-420 kcal')", "protein": "string (e.g. '20-25g')", "calories_kcal": number (single best estimate, e.g. 385), "protein_g": number (single best estimate, e.g. 22), "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
 
 // Gemini free tier often returns 503 "high demand" (or 429 when a model's quota
 // is used up). Retry briefly, then fall back to the next model in the list.
@@ -103,9 +102,11 @@ async function callGemini(model, base64Data, mediaType) {
               food_name: { type: 'string' },
               calories: { type: 'string' },
               protein: { type: 'string' },
+              calories_kcal: { type: 'number' },
+              protein_g: { type: 'number' },
               confidence_note: { type: 'string' }
             },
-            required: ['food_name', 'calories', 'protein', 'confidence_note']
+            required: ['food_name', 'calories', 'protein', 'calories_kcal', 'protein_g', 'confidence_note']
           }
         }
       })
@@ -180,6 +181,94 @@ app.post('/api/analyze', upload.single('photo'), async (req, res) => {
 
     console.log('[step] parsed result:', parsed);
     res.json(parsed);
+  } catch (err) {
+    console.error('[error]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---- Notion food log ----
+const NOTION_VERSION = '2026-03-11';
+const NOTION_TOKEN = process.env.NOTION_TOKEN || '';
+const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
+const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
+let notionDataSourceId = null;
+
+async function notion(path, { method = 'GET', json, body } = {}) {
+  const headers = { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': NOTION_VERSION };
+  if (json) headers['Content-Type'] = 'application/json';
+  const response = await fetch(`https://api.notion.com/v1/${path}`, {
+    method,
+    headers,
+    body: json ? JSON.stringify(json) : body
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Notion ${method} ${path} failed (${response.status}): ${data.message || JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// Pages are created under the database's data source (Notion API 2025-09-03+)
+async function getDataSourceId() {
+  if (!notionDataSourceId) {
+    const db = await notion(`databases/${NOTION_DATABASE_ID}`);
+    notionDataSourceId = db.data_sources?.[0]?.id;
+    if (!notionDataSourceId) throw new Error('Notion database has no data source');
+  }
+  return notionDataSourceId;
+}
+
+async function uploadPhotoToNotion(file) {
+  const created = await notion('file_uploads', {
+    method: 'POST',
+    json: { filename: file.originalname || 'meal.jpg', content_type: file.mimetype }
+  });
+  const form = new FormData();
+  form.append('file', new Blob([file.buffer], { type: file.mimetype }), file.originalname || 'meal.jpg');
+  const sent = await notion(`file_uploads/${created.id}/send`, { method: 'POST', body: form });
+  if (sent.status !== 'uploaded') throw new Error('Notion photo upload did not complete');
+  return created.id;
+}
+
+const text = value => [{ type: 'text', text: { content: String(value || '').slice(0, 2000) } }];
+const numberOrNull = value => (value === '' || value == null || isNaN(Number(value)) ? null : Number(value));
+
+app.post('/api/log', upload.single('photo'), async (req, res) => {
+  if (!NOTION_TOKEN || !NOTION_DATABASE_ID) {
+    return res.status(503).json({ error: 'Food log is not set up (NOTION_TOKEN / NOTION_DATABASE_ID missing).' });
+  }
+  const b = req.body;
+  console.log('[step] logging meal to Notion:', b.food_name);
+
+  try {
+    const dataSourceId = await getDataSourceId();
+    const photoId = req.file ? await uploadPhotoToNotion(req.file) : null;
+
+    const properties = {
+      Food: { title: text(b.food_name || 'Meal') },
+      Date: { date: { start: b.eaten_at || new Date().toISOString() } },
+      'Calories (kcal)': { number: numberOrNull(b.calories_kcal) },
+      'Protein (g)': { number: numberOrNull(b.protein_g) },
+      'Calories range': { rich_text: text(b.calories) },
+      'Protein range': { rich_text: text(b.protein) },
+      Notes: { rich_text: text(b.notes) }
+    };
+    if (MEALS.includes(b.meal)) properties.Meal = { select: { name: b.meal } };
+    if (photoId) {
+      properties.Photo = { files: [{ type: 'file_upload', file_upload: { id: photoId }, name: 'photo.jpg' }] };
+    }
+
+    const page = await notion('pages', {
+      method: 'POST',
+      json: {
+        parent: { type: 'data_source_id', data_source_id: dataSourceId },
+        properties
+      }
+    });
+
+    console.log('[step] saved to Notion:', page.url);
+    res.json({ ok: true, url: page.url });
   } catch (err) {
     console.error('[error]', err);
     res.status(500).json({ error: err.message });
