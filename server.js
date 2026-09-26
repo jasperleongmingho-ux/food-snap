@@ -43,8 +43,31 @@ app.use((req, res, next) => {
 
 app.use(express.static('public'));
 
-const prompt = `Look at this food photo. Respond with ONLY a JSON object, no markdown fences, no extra text, in exactly this shape:
-{"food_name": "string", "calories": "string (e.g. '350-420 kcal')", "protein": "string (e.g. '20-25g')", "calories_kcal": number (single best estimate, e.g. 385), "protein_g": number (single best estimate, e.g. 22), "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
+// Asks for an itemised breakdown so each component (e.g. rice, chicken) is spelled out.
+// userNotes = extra details typed by the user when re-analyzing (missing items, portions).
+function buildPrompt(userNotes) {
+  let p = `Look at this food photo. Identify every separate food component on the plate (e.g. for chicken rice: the rice, the chicken, the cucumber, the sauce) and estimate each one's portion, calories and protein.
+Respond with ONLY a JSON object, no markdown fences, no extra text, in exactly this shape:
+{"food_name": "string (overall dish name)", "items": [{"name": "string", "portion": "string (e.g. '1 cup, ~200g')", "calories_kcal": number, "protein_g": number}], "calories": "string, range for the whole meal (e.g. '350-420 kcal')", "protein": "string, range for the whole meal (e.g. '20-25g')", "calories_kcal": number (best estimate for the whole meal, should equal the sum of items), "protein_g": number (best estimate for the whole meal, should equal the sum of items), "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
+  if (userNotes) {
+    p += `
+
+The person who ate this meal added these details. Treat them as correct: include any items they mention even if not visible in the photo, and use the portions they give:
+"""${userNotes}"""`;
+  }
+  return p;
+}
+
+const ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    name: { type: 'string' },
+    portion: { type: 'string' },
+    calories_kcal: { type: 'number' },
+    protein_g: { type: 'number' }
+  },
+  required: ['name', 'portion', 'calories_kcal', 'protein_g']
+};
 
 // Gemini free tier often returns 503 "high demand" (or 429 when a model's quota
 // is used up). Retry briefly, then fall back to the next model in the list.
@@ -56,12 +79,12 @@ const GEMINI_MODELS = [
 const RETRYABLE_STATUS = new Set([429, 500, 503, 504]);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function analyzeWithGemini(base64Data, mediaType) {
+async function analyzeWithGemini(base64Data, mediaType, prompt) {
   let lastError;
   for (const model of GEMINI_MODELS) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        return await callGemini(model, base64Data, mediaType);
+        return await callGemini(model, base64Data, mediaType, prompt);
       } catch (err) {
         lastError = err;
         if (!RETRYABLE_STATUS.has(err.status)) throw err;
@@ -75,7 +98,7 @@ async function analyzeWithGemini(base64Data, mediaType) {
   throw busy;
 }
 
-async function callGemini(model, base64Data, mediaType) {
+async function callGemini(model, base64Data, mediaType, prompt) {
   console.log(`[step] trying Gemini model ${model}`);
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -100,13 +123,14 @@ async function callGemini(model, base64Data, mediaType) {
             type: 'object',
             properties: {
               food_name: { type: 'string' },
+              items: { type: 'array', items: ITEM_SCHEMA },
               calories: { type: 'string' },
               protein: { type: 'string' },
               calories_kcal: { type: 'number' },
               protein_g: { type: 'number' },
               confidence_note: { type: 'string' }
             },
-            required: ['food_name', 'calories', 'protein', 'calories_kcal', 'protein_g', 'confidence_note']
+            required: ['food_name', 'items', 'calories', 'protein', 'calories_kcal', 'protein_g', 'confidence_note']
           }
         }
       })
@@ -126,7 +150,7 @@ async function callGemini(model, base64Data, mediaType) {
   return parts.map(p => p.text || '').join('');
 }
 
-async function analyzeWithAnthropic(base64Data, mediaType) {
+async function analyzeWithAnthropic(base64Data, mediaType, prompt) {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -136,7 +160,7 @@ async function analyzeWithAnthropic(base64Data, mediaType) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-5',
-      max_tokens: 1000,
+      max_tokens: 2000,
       messages: [
         {
           role: 'user',
@@ -169,15 +193,25 @@ app.post('/api/analyze', upload.single('photo'), async (req, res) => {
 
   const base64Data = req.file.buffer.toString('base64');
   const mediaType = req.file.mimetype;
+  const userNotes = String(req.body.user_notes || '').trim().slice(0, 1000);
+  const prompt = buildPrompt(userNotes);
+  if (userNotes) console.log('[step] re-analyzing with user notes:', userNotes);
 
   try {
     console.log(`[step] calling ${PROVIDER} API`);
     const rawText = PROVIDER === 'anthropic'
-      ? await analyzeWithAnthropic(base64Data, mediaType)
-      : await analyzeWithGemini(base64Data, mediaType);
+      ? await analyzeWithAnthropic(base64Data, mediaType, prompt)
+      : await analyzeWithGemini(base64Data, mediaType, prompt);
 
     const cleaned = rawText.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(cleaned);
+
+    // Keep the meal totals consistent with the item breakdown
+    if (Array.isArray(parsed.items) && parsed.items.length) {
+      const sum = key => parsed.items.reduce((t, i) => t + (Number(i[key]) || 0), 0);
+      parsed.calories_kcal = Math.round(sum('calories_kcal'));
+      parsed.protein_g = Math.round(sum('protein_g') * 10) / 10;
+    }
 
     console.log('[step] parsed result:', parsed);
     res.json(parsed);
@@ -252,6 +286,7 @@ app.post('/api/log', upload.single('photo'), async (req, res) => {
       'Protein (g)': { number: numberOrNull(b.protein_g) },
       'Calories range': { rich_text: text(b.calories) },
       'Protein range': { rich_text: text(b.protein) },
+      Items: { rich_text: text(b.items) },
       Notes: { rich_text: text(b.notes) }
     };
     if (MEALS.includes(b.meal)) properties.Meal = { select: { name: b.meal } };
