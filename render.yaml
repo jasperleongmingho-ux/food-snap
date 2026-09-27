@@ -18,5 +18,3 @@ services:
         sync: false
       - key: NOTION_DATABASE_ID
         value: 2919f77617474f3889d75819557817fa
-      - key: USDA_API_KEY
-        sync: false

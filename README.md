@@ -33,17 +33,11 @@ Restart the server after changing `.env`.
 
 ## How the numbers are calculated
 
-1. The AI identifies each item on the plate and estimates its weight in grams
-   (using any fork/spoon/hand in the photo for scale).
-2. Each item is looked up in USDA FoodData Central (free API) for measured
-   kcal/protein per 100 g. A quick text-only AI call picks the right USDA entry;
-   if no entry fits, or it differs wildly from the AI's own estimate, the AI
-   value is kept. Each item shows its source ("USDA: ..." or "AI estimate").
-3. You can correct the grams per item on the page; calories/protein rescale.
-
-`USDA_API_KEY`: `DEMO_KEY` is used by default but is heavily rate-limited; get
-a free key at https://fdc.nal.usda.gov/api-key-signup. Set `USDA_LOOKUP=off` to
-skip the lookup.
+1. The AI identifies each item on the plate and estimates its weight in grams,
+   calories and protein, assuming Singapore preparation and HPB-style portions,
+   and using any fork/spoon/hand in the photo for scale.
+2. You can correct the grams per item on the page; calories/protein rescale
+   using the AI's per-100 g values.
 
 ## Food log (Notion)
 
