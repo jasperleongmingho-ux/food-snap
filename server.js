@@ -43,12 +43,16 @@ app.use((req, res, next) => {
 
 app.use(express.static('public'));
 
-// Asks for an itemised breakdown so each component (e.g. rice, chicken) is spelled out.
+// ---- AI analysis ----
+
+// Asks for an itemised breakdown so each component (e.g. rice, chicken) is spelled out,
+// with a gram estimate and a USDA-style name used to look up nutrition per 100 g.
 // userNotes = extra details typed by the user when re-analyzing (missing items, portions).
 function buildPrompt(userNotes) {
-  let p = `Look at this food photo. Identify every separate food component on the plate (e.g. for chicken rice: the rice, the chicken, the cucumber, the sauce) and estimate each one's portion, calories and protein.
+  let p = `Look at this food photo. Identify every separate food component on the plate (e.g. for chicken rice: the rice, the chicken, the cucumber, the sauce) and estimate each one's weight in grams, calories and protein.
+To judge portion size, use any size reference visible in the photo (fork, spoon, chopsticks, hand, phone, card, standard plate or bowl). Account for cooking oil, sauces and gravy as their own items when they are likely present.
 Respond with ONLY a JSON object, no markdown fences, no extra text, in exactly this shape:
-{"food_name": "string (overall dish name)", "items": [{"name": "string", "portion": "string (e.g. '1 cup, ~200g')", "calories_kcal": number, "protein_g": number}], "calories": "string, range for the whole meal (e.g. '350-420 kcal')", "protein": "string, range for the whole meal (e.g. '20-25g')", "calories_kcal": number (best estimate for the whole meal, should equal the sum of items), "protein_g": number (best estimate for the whole meal, should equal the sum of items), "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
+{"food_name": "string (overall dish name)", "items": [{"name": "string", "portion": "string, household measure (e.g. '1 cup', '1 piece')", "grams": number (estimated edible weight in grams), "usda_query": "string, generic USDA FoodData Central style description including cooking method (e.g. 'rice, white, cooked', 'chicken, drumstick, meat and skin, roasted')", "calories_kcal": number, "protein_g": number}], "calories": "string, range for the whole meal (e.g. '350-420 kcal')", "protein": "string, range for the whole meal (e.g. '20-25g')", "calories_kcal": number (best estimate for the whole meal, should equal the sum of items), "protein_g": number (best estimate for the whole meal, should equal the sum of items), "confidence_note": "string, 1-2 sentences explaining this is a visual estimate and what affects accuracy"}`;
   if (userNotes) {
     p += `
 
@@ -63,10 +67,26 @@ const ITEM_SCHEMA = {
   properties: {
     name: { type: 'string' },
     portion: { type: 'string' },
+    grams: { type: 'number' },
+    usda_query: { type: 'string' },
     calories_kcal: { type: 'number' },
     protein_g: { type: 'number' }
   },
-  required: ['name', 'portion', 'calories_kcal', 'protein_g']
+  required: ['name', 'portion', 'grams', 'usda_query', 'calories_kcal', 'protein_g']
+};
+
+const ANALYSIS_SCHEMA = {
+  type: 'object',
+  properties: {
+    food_name: { type: 'string' },
+    items: { type: 'array', items: ITEM_SCHEMA },
+    calories: { type: 'string' },
+    protein: { type: 'string' },
+    calories_kcal: { type: 'number' },
+    protein_g: { type: 'number' },
+    confidence_note: { type: 'string' }
+  },
+  required: ['food_name', 'items', 'calories', 'protein', 'calories_kcal', 'protein_g', 'confidence_note']
 };
 
 // Gemini free tier often returns 503 "high demand" (or 429 when a model's quota
@@ -79,12 +99,20 @@ const GEMINI_MODELS = [
 const RETRYABLE_STATUS = new Set([429, 500, 503, 504]);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function analyzeWithGemini(base64Data, mediaType, prompt) {
+// Ask the configured AI for JSON. `image` is optional ({ base64, mediaType }).
+async function generateJson({ prompt, schema, image, models = GEMINI_MODELS }) {
+  const rawText = PROVIDER === 'anthropic'
+    ? await callAnthropic(prompt, image)
+    : await callGeminiWithFallback(prompt, schema, image, models);
+  return JSON.parse(rawText.replace(/```json|```/g, '').trim());
+}
+
+async function callGeminiWithFallback(prompt, schema, image, models) {
   let lastError;
-  for (const model of GEMINI_MODELS) {
+  for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        return await callGemini(model, base64Data, mediaType, prompt);
+        return await callGemini(model, prompt, schema, image);
       } catch (err) {
         lastError = err;
         if (!RETRYABLE_STATUS.has(err.status)) throw err;
@@ -98,8 +126,11 @@ async function analyzeWithGemini(base64Data, mediaType, prompt) {
   throw busy;
 }
 
-async function callGemini(model, base64Data, mediaType, prompt) {
+async function callGemini(model, prompt, schema, image) {
   console.log(`[step] trying Gemini model ${model}`);
+  const parts = [{ text: prompt }];
+  if (image) parts.unshift({ inline_data: { mime_type: image.mediaType, data: image.base64 } });
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
@@ -109,30 +140,8 @@ async function callGemini(model, base64Data, mediaType, prompt) {
         'x-goog-api-key': process.env.GEMINI_API_KEY
       },
       body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { inline_data: { mime_type: mediaType, data: base64Data } },
-              { text: prompt }
-            ]
-          }
-        ],
-        generationConfig: {
-          response_mime_type: 'application/json',
-          response_schema: {
-            type: 'object',
-            properties: {
-              food_name: { type: 'string' },
-              items: { type: 'array', items: ITEM_SCHEMA },
-              calories: { type: 'string' },
-              protein: { type: 'string' },
-              calories_kcal: { type: 'number' },
-              protein_g: { type: 'number' },
-              confidence_note: { type: 'string' }
-            },
-            required: ['food_name', 'items', 'calories', 'protein', 'calories_kcal', 'protein_g', 'confidence_note']
-          }
-        }
+        contents: [{ parts }],
+        generationConfig: { response_mime_type: 'application/json', response_schema: schema }
       })
     }
   );
@@ -146,11 +155,14 @@ async function callGemini(model, base64Data, mediaType, prompt) {
     throw err;
   }
 
-  const parts = data.candidates?.[0]?.content?.parts || [];
-  return parts.map(p => p.text || '').join('');
+  const out = data.candidates?.[0]?.content?.parts || [];
+  return out.map(p => p.text || '').join('');
 }
 
-async function analyzeWithAnthropic(base64Data, mediaType, prompt) {
+async function callAnthropic(prompt, image) {
+  const content = [{ type: 'text', text: prompt }];
+  if (image) content.unshift({ type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.base64 } });
+
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -161,15 +173,7 @@ async function analyzeWithAnthropic(base64Data, mediaType, prompt) {
     body: JSON.stringify({
       model: 'claude-sonnet-5',
       max_tokens: 2000,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } },
-            { type: 'text', text: prompt }
-          ]
-        }
-      ]
+      messages: [{ role: 'user', content }]
     })
   });
 
@@ -184,6 +188,119 @@ async function analyzeWithAnthropic(base64Data, mediaType, prompt) {
   return textBlock ? textBlock.text : '';
 }
 
+// ---- USDA FoodData Central lookup (free: https://fdc.nal.usda.gov/api-guide) ----
+// Replaces the AI's remembered nutrition values with measured values per 100 g.
+// The AI still identifies the food and estimates grams.
+const USDA_API_KEY = process.env.USDA_API_KEY || 'DEMO_KEY';
+const USDA_ENABLED = (process.env.USDA_LOOKUP || 'on').toLowerCase() !== 'off';
+const usdaCache = new Map();
+const round1 = n => Math.round(n * 10) / 10;
+
+async function searchUsda(query) {
+  const key = query.toLowerCase().trim();
+  if (usdaCache.has(key)) return usdaCache.get(key);
+
+  const response = await fetch(`https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${encodeURIComponent(USDA_API_KEY)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, dataType: ['Foundation', 'SR Legacy', 'Survey (FNDDS)'], pageSize: 8 })
+  });
+  if (!response.ok) throw new Error(`USDA search failed (${response.status})`);
+  const data = await response.json();
+
+  // Values in search results are per 100 g for these data types
+  const pick = (food, number, unit) =>
+    food.foodNutrients.find(x => String(x.nutrientNumber) === number && (!unit || x.unitName === unit))?.value ?? null;
+  const candidates = (data.foods || [])
+    .map(f => ({
+      fdcId: f.fdcId,
+      description: f.description,
+      // 208 = Energy; Foundation foods may only have Atwater energy (958 specific, 957 general)
+      kcal: pick(f, '208', 'KCAL') ?? pick(f, '958', 'KCAL') ?? pick(f, '957', 'KCAL'),
+      protein: pick(f, '203')
+    }))
+    .filter(c => c.kcal != null && c.protein != null);
+
+  usdaCache.set(key, candidates);
+  return candidates;
+}
+
+// USDA's top search hit is often a near-miss (e.g. "glutinous rice" for white rice,
+// "chicken skin" for drumstick), so a quick text-only AI call picks the right candidate.
+async function enrichWithUsda(items) {
+  const withCandidates = await Promise.all(items.map(async item => {
+    try {
+      return await searchUsda(item.usda_query || item.name);
+    } catch (err) {
+      console.warn('[warn] USDA lookup failed for', item.name, err.message);
+      return [];
+    }
+  }));
+  if (!withCandidates.some(c => c.length)) return;
+
+  const listing = items.map((item, i) =>
+    `Item ${i}: "${item.name}" (${item.usda_query}` +
+    (item.grams > 0 ? `, AI estimate ${Math.round(item.calories_kcal / item.grams * 100)} kcal/100g` : '') + `)\n` +
+    (withCandidates[i].length
+      ? withCandidates[i].map((c, j) => `  ${j}: ${c.description} (${Math.round(c.kcal)} kcal, ${round1(c.protein)} g protein per 100g)`).join('\n')
+      : '  (no candidates)')
+  ).join('\n');
+
+  let choices = [];
+  try {
+    const result = await generateJson({
+      prompt: `Match each food item to the USDA FoodData Central entry that best describes it (same food, same cooking method, same part, e.g. meat vs skin only). If no candidate is a reasonable match, use -1.\n\n${listing}\n\nRespond with ONLY JSON: {"choices": [{"item": number, "candidate": number}]}`,
+      schema: {
+        type: 'object',
+        properties: { choices: { type: 'array', items: { type: 'object', properties: { item: { type: 'number' }, candidate: { type: 'number' } }, required: ['item', 'candidate'] } } },
+        required: ['choices']
+      },
+      // Matching is a simple text task: start with the lighter models to save quota
+      models: [...GEMINI_MODELS.slice(1), GEMINI_MODELS[0]]
+    });
+    choices = result.choices || [];
+  } catch (err) {
+    console.warn('[warn] USDA matching step failed, keeping AI values:', err.message);
+    return;
+  }
+
+  for (const { item: i, candidate: j } of choices) {
+    const item = items[i];
+    const match = withCandidates[i]?.[j];
+    if (!item || !match) continue;
+
+    // Sanity check against the AI's own estimate: a wildly different energy
+    // density usually means a bad match, so keep the AI value instead.
+    const aiPer100 = item.grams > 0 ? (item.calories_kcal / item.grams) * 100 : null;
+    const ratio = aiPer100 ? match.kcal / aiPer100 : 1;
+    if (aiPer100 && (ratio < 0.5 || ratio > 2)) {
+      console.warn(`[warn] USDA match for ${item.name} looks off (${match.description}), keeping AI values`);
+      continue;
+    }
+    item.kcal_per_100g = round1(match.kcal);
+    item.protein_per_100g = round1(match.protein);
+    item.source = `USDA: ${match.description}`;
+  }
+}
+
+// Every item ends up with per-100 g values so the page can rescale when grams are edited
+function finalizeItems(items) {
+  for (const item of items) {
+    const grams = Number(item.grams) || 0;
+    if (item.kcal_per_100g == null) {
+      item.kcal_per_100g = grams > 0 ? round1(item.calories_kcal / grams * 100) : 0;
+      item.protein_per_100g = grams > 0 ? round1(item.protein_g / grams * 100) : 0;
+      item.source = 'AI estimate';
+    }
+    if (grams > 0) {
+      item.calories_kcal = Math.round(item.kcal_per_100g * grams / 100);
+      item.protein_g = round1(item.protein_per_100g * grams / 100);
+    }
+    item.grams = Math.round(grams);
+    delete item.usda_query;
+  }
+}
+
 app.post('/api/analyze', upload.single('photo'), async (req, res) => {
   console.log('[step] received upload:', req.file?.originalname, req.file?.mimetype, req.file?.size);
 
@@ -191,29 +308,28 @@ app.post('/api/analyze', upload.single('photo'), async (req, res) => {
     return res.status(400).json({ error: 'No photo uploaded' });
   }
 
-  const base64Data = req.file.buffer.toString('base64');
-  const mediaType = req.file.mimetype;
+  const image = { base64: req.file.buffer.toString('base64'), mediaType: req.file.mimetype };
   const userNotes = String(req.body.user_notes || '').trim().slice(0, 1000);
-  const prompt = buildPrompt(userNotes);
   if (userNotes) console.log('[step] re-analyzing with user notes:', userNotes);
 
   try {
     console.log(`[step] calling ${PROVIDER} API`);
-    const rawText = PROVIDER === 'anthropic'
-      ? await analyzeWithAnthropic(base64Data, mediaType, prompt)
-      : await analyzeWithGemini(base64Data, mediaType, prompt);
+    const parsed = await generateJson({ prompt: buildPrompt(userNotes), schema: ANALYSIS_SCHEMA, image });
+    const items = Array.isArray(parsed.items) ? parsed.items : [];
 
-    const cleaned = rawText.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
+    if (USDA_ENABLED && items.length) {
+      console.log('[step] looking up USDA nutrition data');
+      await enrichWithUsda(items);
+    }
+    finalizeItems(items);
 
     // Keep the meal totals consistent with the item breakdown
-    if (Array.isArray(parsed.items) && parsed.items.length) {
-      const sum = key => parsed.items.reduce((t, i) => t + (Number(i[key]) || 0), 0);
-      parsed.calories_kcal = Math.round(sum('calories_kcal'));
-      parsed.protein_g = Math.round(sum('protein_g') * 10) / 10;
+    if (items.length) {
+      parsed.calories_kcal = Math.round(items.reduce((t, i) => t + i.calories_kcal, 0));
+      parsed.protein_g = round1(items.reduce((t, i) => t + i.protein_g, 0));
     }
 
-    console.log('[step] parsed result:', parsed);
+    console.log('[step] parsed result:', JSON.stringify(parsed));
     res.json(parsed);
   } catch (err) {
     console.error('[error]', err);

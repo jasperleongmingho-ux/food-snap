@@ -39,7 +39,13 @@
   .item { display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; border-bottom: 1px solid #e4e2dc; font-size: 0.92rem; }
   .item:last-child { border-bottom: none; }
   .item .portion { display: block; font-size: 0.8rem; color: #6b6b66; }
-  .item .nums { text-align: right; white-space: nowrap; color: #3b3b37; }
+  /* Item row: name | grams | kcal·protein, with portion + data source on a full-width line below */
+  .item:not(.total) { display: grid; grid-template-columns: 1fr auto auto; column-gap: 8px; row-gap: 2px; align-items: center; }
+  .item .item-name { min-width: 0; }
+  .item .item-detail { grid-column: 1 / -1; font-size: 0.78rem; color: #6b6b66; }
+  .item .nums { text-align: right; white-space: nowrap; color: #3b3b37; font-size: 0.85rem; min-width: 92px; }
+  .item .grams { display: flex; align-items: center; gap: 3px; font-size: 0.85rem; color: #6b6b66; white-space: nowrap; }
+  .item .grams input { width: 58px; padding: 6px; font-size: 1rem; border: 1px solid #e4e2dc; border-radius: 6px; text-align: right; color: inherit; background: #fff; }
   .item.total { background: #f3f2ee; font-weight: 600; }
   textarea { width: 100%; box-sizing: border-box; padding: 10px; font-size: 1rem; font-family: inherit; border: 1px solid #e4e2dc; border-radius: 8px; resize: vertical; min-height: 64px; color: inherit; background: #fff; }
   button.secondary { background: #fff; color: #3b6e4f; border: 1.5px solid #3b6e4f; }
@@ -192,33 +198,77 @@
   cameraInput.addEventListener('change', () => onFileChosen(cameraInput));
   galleryInput.addEventListener('change', () => onFileChosen(galleryInput));
 
-  function renderItems(items, totalKcal, totalProtein) {
+  const round1 = n => Math.round(n * 10) / 10;
+  const numsText = (kcal, protein) => `${Math.round(kcal)} kcal · ${round1(protein)} g`;
+
+  // Each item row has an editable grams box; calories/protein rescale from the
+  // per-100 g values (USDA when matched, otherwise the AI's own estimate).
+  function renderItems(items) {
     const box = $('items');
     box.innerHTML = '';
-    const row = (name, portion, nums, cls) => {
-      const div = document.createElement('div');
-      div.className = 'item' + (cls ? ' ' + cls : '');
-      const left = document.createElement('div');
-      left.textContent = name;
-      if (portion) {
-        const p = document.createElement('span');
-        p.className = 'portion';
-        p.textContent = portion;
-        left.append(p);
-      }
-      const right = document.createElement('div');
-      right.className = 'nums';
-      right.textContent = nums;
-      div.append(left, right);
-      box.append(div);
+    const totalNums = document.createElement('div');
+
+    const updateTotals = () => {
+      const kcal = items.reduce((t, i) => t + i.calories_kcal, 0);
+      const protein = items.reduce((t, i) => t + i.protein_g, 0);
+      totalNums.textContent = numsText(kcal, protein);
+      $('caloriesKcal').value = Math.round(kcal);
+      $('proteinG').value = round1(protein);
     };
-    (items || []).forEach(i => row(i.name, i.portion, `${Math.round(i.calories_kcal)} kcal · ${i.protein_g} g`));
-    row('Total', '', `${totalKcal ?? '?'} kcal · ${totalProtein ?? '?'} g`, 'total');
+
+    items.forEach(item => {
+      const div = document.createElement('div');
+      div.className = 'item';
+
+      const left = document.createElement('div');
+      left.className = 'item-name';
+      left.textContent = item.name;
+      const detail = document.createElement('div');
+      detail.className = 'item-detail';
+      detail.textContent = [item.portion, item.source].filter(Boolean).join(' · ');
+
+      const grams = document.createElement('label');
+      grams.className = 'grams';
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.inputMode = 'numeric';
+      input.min = '0';
+      input.value = item.grams || '';
+      input.setAttribute('aria-label', `${item.name} grams`);
+      grams.append(input, ' g');
+
+      const nums = document.createElement('div');
+      nums.className = 'nums';
+      nums.textContent = numsText(item.calories_kcal, item.protein_g);
+
+      input.addEventListener('input', () => {
+        const g = Math.max(0, Number(input.value) || 0);
+        item.grams = g;
+        item.calories_kcal = Math.round(item.kcal_per_100g * g / 100);
+        item.protein_g = round1(item.protein_per_100g * g / 100);
+        nums.textContent = numsText(item.calories_kcal, item.protein_g);
+        updateTotals();
+      });
+
+      div.append(left, grams, nums, detail);
+      box.append(div);
+    });
+
+    const total = document.createElement('div');
+    total.className = 'item total';
+    const label = document.createElement('div');
+    label.textContent = 'Total';
+    totalNums.className = 'nums';
+    total.append(label, totalNums);
+    box.append(total);
+    updateTotals();
   }
 
   // Plain-text breakdown saved to the Notion "Items" column
   function itemsAsText(items) {
-    return (items || []).map(i => `• ${i.name} (${i.portion}): ${Math.round(i.calories_kcal)} kcal, ${i.protein_g} g protein`).join('\n');
+    return (items || []).map(i =>
+      `• ${i.name} (${i.grams} g): ${Math.round(i.calories_kcal)} kcal, ${round1(i.protein_g)} g protein [${i.source || 'AI estimate'}]`
+    ).join('\n');
   }
 
   async function runAnalysis(userNotes) {
@@ -243,9 +293,9 @@
       lastResult = parsed;
       lastResult.user_notes = userNotes || '';
       $('foodName').value = parsed.food_name || '';
-      renderItems(parsed.items, parsed.calories_kcal, parsed.protein_g);
       $('caloriesKcal').value = parsed.calories_kcal ?? '';
       $('proteinG').value = parsed.protein_g ?? '';
+      if (parsed.items?.length) renderItems(parsed.items);
       $('caloriesRange').textContent = parsed.calories ? 'AI range: ' + parsed.calories : '';
       $('proteinRange').textContent = parsed.protein ? 'AI range: ' + parsed.protein : '';
       if (!userNotes) {
